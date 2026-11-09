@@ -5,6 +5,10 @@ Tip a glass and the balls pour out of its rim, one at a time, and land in the ot
 over WiFi (ESP-NOW: board to board, no router, no laptop needed). It works both ways, and
 there are always exactly 27 balls.
 
+[![Two boards pouring balls into each other](media/ball-pour.gif)](media/ball-pour.mp4)
+
+*Click for the full video (with sound).*
+
 The whole project is one file: [`project.yaml`](project.yaml), built with the Atech SDK.
 
 ## Hardware (per board)
