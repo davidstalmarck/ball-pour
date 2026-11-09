@@ -1,0 +1,623 @@
+name: ball_pour
+board: 14port
+# Pour 27 rainbow balls between two glasses, both ways, over WiFi.
+#
+# Each board is a glass: the six 3x3 grids in the left column (ports 1-6) are a strip
+# 3 lights wide and 18 tall. Port 6 is the bottom, port 1 the rim. The balls rest at
+# the bottom and fall like they have weight. Tip a glass rim-down and its balls run
+# to the rim and pour out, one after another, into the other glass: they come in at
+# its rim, in the order they were poured, and fall to its bottom. Both ways.
+#
+# Glass A starts full: a rainbow, red at the bottom to violet at the top. Glass B
+# starts empty. There are always exactly 27 balls. They pour one at a time, 150 ms
+# apart. The pouring glass shows TX, the catching one RX; each screen shows how
+# many balls the other glass holds (sent over WiFi).
+#
+# The radio is ESP-NOW: WiFi, board to board, no router, no laptop, so the boards run
+# on powerbanks. Each board numbers the balls it pours and repeats the newest ones
+# 5 times a second; the other board takes each number once. A lost message is made
+# up by the next one, and no ball is lost or doubled. If either board restarts, A
+# refills and B empties.
+#
+# Which board is A is set once over USB and remembered:
+#   atech send balls_role tx --port <A's port>      # A: starts full
+#   atech send balls_role rx --port <B's port>      # B: starts empty
+#
+# The button (port 11):
+#   short press, glass standing up (port 6 down): learn which way is down.
+#   short press, lying flat:                      take this as level.
+#   hold 2 s on A:                                refill A with 27 balls, empty B.
+# The light flashes green when it took it, red when it could not tell.
+#
+# The knob (ports 13+14) is settings. Press it, turn to choose, press to pick:
+#   Direction  which end is the glass's mouth: port 1 or port 6 (this glass only)
+#   Brightness 1..10, live
+#   Colours    Rainbow, or 1-4 colours: pick how many, then each one from 12
+#   Done       (the menu also closes after 20 s untouched)
+# Brightness and colours go to the other glass over WiFi, so a ball looks the
+# same in both. Everything is remembered.
+modules:
+  - {id: neopixel,   instance: g1,     port: 1}
+  - {id: neopixel,   instance: g2,     port: 2}
+  - {id: neopixel,   instance: g3,     port: 3}
+  - {id: neopixel,   instance: g4,     port: 4}
+  - {id: neopixel,   instance: g5,     port: 5}
+  - {id: neopixel,   instance: g6,     port: 6}
+  - {id: icm40608,   instance: imu,    port: 7}
+  - {id: st7735_tft, instance: screen, ports: [9, 10]}
+  - {id: button,     instance: btn,    port: 11}
+  - {id: rotary_encoder, instance: knob, ports: [13, 14]}
+code:
+  globals: |
+    // Set to 0 to run without the radio (atech emulate has no radio).
+    #define USE_RADIO 1
+    #if USE_RADIO
+    #include <WiFi.h>
+    #include <esp_now.h>
+    #include <esp_wifi.h>
+    #endif
+    #include <Preferences.h>
+
+    // ---- the glass -----------------------------------------------------------------
+    // Row 0 = port-1 end (the rim), row 17 = port-6 end (the bottom).
+    static const int ROWS = 18, COLS = 3;
+    static const int NBALLS = 27;
+    static const uint8_t EMPTY = 0xFF;
+    static uint8_t cell[ROWS][COLS];           // ball id, or EMPTY
+    static float vel[NBALLS], acc[NBALLS];     // fall speed (cells/tick), sub-cell travel
+    static uint32_t movedTick[NBALLS], tickNo = 0;
+    static NeoPixelGrid *grids[6] = {&g1, &g2, &g3, &g4, &g5, &g6};
+    static const bool GRID_FLIP_ROW = true, GRID_FLIP_COL = true;    // each 3x3 grid sits turned 180 degrees
+    static const uint8_t BRIGHT[10] = {2, 4, 6, 9, 12, 16, 20, 26, 34, 51};   // of 255 (cap 51)
+    static uint8_t brightLevel = 4;            // index into BRIGHT: 12 by default
+    static bool flipEnds = false;              // true: the mouth is at port 6
+
+    // Shared settings (go to the other glass): version, colour count (0 = rainbow), palette picks.
+    static uint16_t setVer = 0;
+    static uint8_t nColours = 0, colourPick[4] = {0, 4, 8, 10};
+
+    // ---- role: 0 not set, 1 A (starts full), 2 B (balls_role, remembered) -------------
+    static uint8_t role = 0;
+    static bool isA() { return role == 1; }
+    static bool isB() { return role == 2; }
+
+    // ---- which way is down (button / balls_calibrate) -------------------------------
+    static int longAxis = 0;          // accelerometer axis along the strip (0=x 1=y); measured on B
+    static float longSign = -1;       // gLong = longSign * accel[longAxis]; + = toward port 6
+    static float latSign = -1;
+    static float zeroX = 0, zeroY = 0;
+    static bool calibrated = false;
+    static Preferences prefs;
+
+    // ---- colours: a rainbow, or 1-4 picked colours in bands ---------------------------
+    struct Named { const char *name; uint8_t r, g, b; };
+    static const Named PALETTE[12] = {
+      {"red", 255, 0, 0},     {"orange", 255, 90, 0}, {"yellow", 255, 200, 0}, {"lime", 140, 255, 0},
+      {"green", 0, 255, 30},  {"teal", 0, 255, 140},  {"cyan", 0, 220, 255},   {"blue", 0, 60, 255},
+      {"purple", 130, 0, 255},{"magenta", 255, 0, 200},{"pink", 255, 80, 120}, {"white", 255, 255, 255},
+    };
+    static const int NPAL = 12;
+    static uint8_t ballR[NBALLS], ballG[NBALLS], ballB[NBALLS];
+    static void hueRGB(float h, uint8_t &R, uint8_t &G, uint8_t &B) {
+      int k = (int)h; float f = h - k, q = 1 - f, r, g, b;
+      switch (k) { case 0: r=1; g=f; b=0; break; case 1: r=q; g=1; b=0; break;
+                   case 2: r=0; g=1; b=f; break; case 3: r=0; g=q; b=1; break;
+                   case 4: r=f; g=0; b=1; break; default: r=1; g=0; b=q; }
+      R = r * 255; G = g * 255; B = b * 255;
+    }
+    // Ball 0 lies at the bottom of a full glass; with N colours ball i gets band i*N/27.
+    static void makeColours() {
+      for (int i = 0; i < NBALLS; i++) {
+        if (nColours == 0) { hueRGB(i * 4.7f / (NBALLS - 1), ballR[i], ballG[i], ballB[i]); continue; }
+        int band = i * nColours / NBALLS;
+        const Named &c = PALETTE[colourPick[band] % NPAL];
+        ballR[i] = c.r; ballG[i] = c.g; ballB[i] = c.b;
+      }
+    }
+    static uint16_t rgb565(int i) {
+      return ((ballR[i] & 0xF8) << 8) | ((ballG[i] & 0xFC) << 3) | (ballB[i] >> 3);
+    }
+
+    // ---- balls ------------------------------------------------------------------------
+    static bool owned(int id) {
+      for (int r = 0; r < ROWS; r++) for (int c = 0; c < COLS; c++) if (cell[r][c] == id) return true;
+      return false;
+    }
+    static int countHere() {
+      int n = 0;
+      for (int r = 0; r < ROWS; r++) for (int c = 0; c < COLS; c++) if (cell[r][c] != EMPTY) n++;
+      return n;
+    }
+    // Put a ball in the free cell nearest an end (row 0 or ROWS-1). False if full.
+    static bool placeNear(int edgeRow, uint8_t id, int prefCol, float v) {
+      for (int i = 0; i < ROWS; i++) {
+        int r = edgeRow == 0 ? i : ROWS - 1 - i;
+        for (int k = 0; k < COLS; k++) {
+          int c = (prefCol + k) % COLS;
+          if (cell[r][c] == EMPTY) { cell[r][c] = id; vel[id] = v; acc[id] = 0; movedTick[id] = tickNo; return true; }
+        }
+      }
+      return false;
+    }
+    static void clearGlass() { memset(cell, EMPTY, sizeof cell); }
+    static void fillGlass() {                       // red at the bottom, violet on top
+      clearGlass();
+      for (int id = 0; id < NBALLS; id++) placeNear(ROWS - 1, id, id % COLS, 0);
+    }
+
+    // ---- what has poured, numbered ------------------------------------------------------
+    // outSeq counts the balls this glass has poured out (this round); the last LOG of
+    // them are kept by number. inSeq counts the other glass's pours taken in.
+    static const int LOG = 32;
+    static uint16_t outSeq = 0, inSeq = 0;
+    static uint8_t outLog[LOG];                    // outLog[seq % LOG] = ball id
+    static uint32_t pouredTotal = 0, receivedTotal = 0;   // for the screen, this round
+
+    // Balls waiting to come in at the rim, one every 60 ms so they look poured.
+    static uint8_t pending[NBALLS + LOG], nPending = 0;
+    static unsigned long lastEntryMs = 0;
+
+    // ---- radio: both boards send and listen ----------------------------------------------
+    struct __attribute__((packed)) Beat {
+      char magic[4];
+      uint8_t role;        // 1 A, 2 B
+      uint8_t round;       // A's round; B echoes the one it is in
+      uint16_t boot;       // random per power-on: a restart is noticed
+      uint16_t outSeq;     // balls poured by the sender this round
+      uint8_t count;       // balls the sender holds (in the glass or coming in)
+      uint16_t setVer;     // shared settings, newest version wins
+      uint8_t nColours, pick[4], bright;
+      uint8_t log[LOG];    // log[s % LOG] = ball id poured as number s
+    };
+    static const char MAGIC[4] = {'A', 'B', 'P', '7'};
+    static uint8_t roundNo = 0;
+    static uint16_t bootId = 0, peerBoot = 0;
+    static unsigned long lastHeardMs = 0;
+    static bool heard() { return lastHeardMs && millis() - lastHeardMs < 2000; }
+    static uint32_t sentCount = 0, heardCount = 0, lostCount = 0;
+    static int peerCount = 0;
+    static unsigned long lastPourMs = 0, lastInMs = 0;   // for TX / RX on the screen
+    static const int POUR_MS = 150;                       // one ball at a time
+    static uint8_t myMac[6];
+    static bool needRefill = false;
+
+    #if USE_RADIO
+    static const uint8_t BCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    static QueueHandle_t rxQueue;
+    static void onRecv(const uint8_t *, const uint8_t *data, int len) {
+      if (len != (int)sizeof(Beat) || memcmp(data, MAGIC, 4) != 0) return;
+      Beat b; memcpy(&b, data, sizeof b);
+      xQueueOverwrite(rxQueue, &b);               // only the newest matters
+    }
+    static void radioBegin() {
+      rxQueue = xQueueCreate(1, sizeof(Beat));
+      WiFi.mode(WIFI_STA);
+      WiFi.disconnect();
+      esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+      WiFi.macAddress(myMac);
+      if (esp_now_init() != ESP_OK) { Serial.println("{\"type\":\"log\",\"payload\":\"esp_now_init failed\"}"); return; }
+      esp_now_register_recv_cb(onRecv);
+      esp_now_peer_info_t p = {};
+      memcpy(p.peer_addr, BCAST, 6); p.channel = 0; p.encrypt = false;
+      esp_now_add_peer(&p);
+    }
+    static void sendBeat() {
+      if (!role) return;
+      Beat b; memcpy(b.magic, MAGIC, 4);
+      b.role = role; b.round = roundNo; b.boot = bootId; b.outSeq = outSeq;
+      b.count = countHere() + nPending;
+      b.setVer = setVer; b.nColours = nColours; memcpy(b.pick, colourPick, 4); b.bright = brightLevel;
+      memcpy(b.log, outLog, LOG);
+      if (esp_now_send(BCAST, (uint8_t *)&b, sizeof b) == ESP_OK) sentCount++;
+    }
+    static bool takeBeat(Beat &b) { return xQueueReceive(rxQueue, &b, 0) == pdTRUE; }
+    #else
+    static void radioBegin() { memset(myMac, 0, 6); }
+    static void sendBeat() {}
+    static bool takeBeat(Beat &) { return false; }
+    #endif
+
+    // Use the current settings; save=true also stores them and bumps the version.
+    static void applySettings(bool save) {
+      makeColours();
+      for (int i = 0; i < 6; i++) grids[i]->setBrightness(BRIGHT[brightLevel]);
+      if (save) setVer++;
+      prefs.putUShort("sv", setVer); prefs.putUChar("nc", nColours);
+      prefs.putBytes("pk", colourPick, 4); prefs.putUChar("br", brightLevel); prefs.putBool("flip", flipEnds);
+    }
+
+    static void newRound(uint8_t r) {             // A: full. B: empty. Counters from zero.
+      roundNo = r;
+      outSeq = inSeq = 0; nPending = 0; pouredTotal = receivedTotal = 0;
+      if (isA()) fillGlass(); else clearGlass();
+    }
+
+    static void onBeat(const Beat &b) {
+      if (b.role == role) return;                  // another board with my role: ignore
+      lastHeardMs = millis(); heardCount++;
+      peerCount = b.count;
+      if (b.setVer > setVer && b.nColours <= 4 && b.bright < 10) {   // the other glass changed settings
+        setVer = b.setVer; nColours = b.nColours; memcpy(colourPick, b.pick, 4); brightLevel = b.bright;
+        applySettings(false);
+      }
+      bool restarted = peerBoot && b.boot != peerBoot;
+      peerBoot = b.boot;
+      if (isA()) {
+        if (restarted) { needRefill = true; return; }   // B restarted: its balls are gone
+        if (needRefill || b.round != roundNo) return;   // B has not joined this round yet
+      } else {
+        if (b.round != roundNo || restarted) newRound(b.round);   // A restarted or refilled
+      }
+      if (b.outSeq < inSeq) return;                // stale
+      if (b.outSeq - inSeq > LOG) { lostCount += b.outSeq - inSeq - LOG; inSeq = b.outSeq - LOG; }
+      while (inSeq < b.outSeq) {
+        uint8_t id = b.log[inSeq % LOG];
+        if (id < NBALLS && !owned(id)) pending[nPending++] = id;
+        inSeq++; receivedTotal++;
+      }
+    }
+
+    static void letIn() {                          // one ball through the rim every 60 ms
+      if (!nPending || millis() - lastEntryMs < POUR_MS) return;
+      uint8_t id = pending[0];
+      // Already here (cannot happen unless messages crossed): drop it, never double it.
+      if (owned(id) || placeNear(0, id, id % COLS, 0.5f)) {
+        lastEntryMs = lastInMs = millis();
+        memmove(pending, pending + 1, --nPending);
+      }
+    }
+
+    // ---- physics: falling sand with weight ----------------------------------------------
+    static const int TICK_MS = 20;
+    static const float GRAVITY = 0.035f;     // cells/tick added per tick at 1 g
+    static const float VMAX = 1.0f;          // cells per tick at most
+    static bool pouredNow = false;
+
+    static int sgn(float v, float dead) { return v > dead ? 1 : (v < -dead ? -1 : 0); }
+
+    // Move the ball at r,c by dr,dc. Out of the rim: poured to the other glass.
+    static bool tryMove(int &r, int &c, int dr, int dc) {
+      int nr = r + dr, nc = c + dc;
+      if (nc < 0 || nc >= COLS || nr >= ROWS) return false;
+      if (nr < 0) {
+        if (!role || dc != 0 || millis() - lastPourMs < POUR_MS) return false;
+        lastPourMs = millis();
+        outLog[outSeq % LOG] = cell[r][c];
+        outSeq++; pouredTotal++;
+        cell[r][c] = EMPTY;
+        pouredNow = true;
+        r = -1;
+        return true;
+      }
+      if (cell[nr][nc] != EMPTY) return false;
+      cell[nr][nc] = cell[r][c]; cell[r][c] = EMPTY;
+      r = nr; c = nc;
+      return true;
+    }
+
+    static void step(float gLong, float gLat) {
+      tickNo++;
+      int dr = sgn(gLong, 0.08f), dc = sgn(gLat, 0.3f);
+      static uint8_t slideTick = 0;
+      bool slideNow = (++slideTick % 3) == 0;      // sideways: one cell every 3 ticks
+      for (int i = 0; i < ROWS; i++) {
+        int r0 = dr > 0 ? ROWS - 1 - i : i;        // start at the downhill end
+        for (int j = 0; j < COLS; j++) {
+          int c0 = dc > 0 ? COLS - 1 - j : j;
+          uint8_t id = cell[r0][c0];
+          if (id == EMPTY || movedTick[id] == tickNo) continue;
+          movedTick[id] = tickNo;
+          int r = r0, c = c0;
+          if (dr == 0) {
+            vel[id] = 0;
+            if (dc && slideNow) tryMove(r, c, 0, dc);
+            continue;
+          }
+          vel[id] = fminf(vel[id] + GRAVITY * fabsf(gLong), VMAX);
+          acc[id] += vel[id];
+          while (acc[id] >= 1.0f && r >= 0) {
+            acc[id] -= 1.0f;
+            int s = random(2) ? 1 : -1;
+            bool ok = (dc && tryMove(r, c, dr, dc)) || tryMove(r, c, dr, 0) ||
+                      tryMove(r, c, dr, s) || tryMove(r, c, dr, -s);
+            if (!ok) {
+              vel[id] = 0; acc[id] = 0;
+              if (dc && slideNow) tryMove(r, c, 0, dc);
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    // ---- calibration (button) --------------------------------------------------------------
+    static unsigned long msgUntil = 0;
+    static const char *msg = "";
+    static void flash(bool ok, const char *m) {
+      msg = m; msgUntil = millis() + 2000;
+      if (ok) btn.setColor(0, 255, 0); else btn.setColor(255, 0, 0);
+    }
+    static void calibrate() {
+      if (!imu.isConnected()) { flash(false, "NO IMU"); return; }
+      float a[3] = {imu.readAccelX(), imu.readAccelY(), imu.readAccelZ()};
+      if (fabsf(a[2]) > 0.85f) {                   // lying flat: level
+        zeroX = a[0]; zeroY = a[1];
+        prefs.putFloat("zx", zeroX); prefs.putFloat("zy", zeroY);
+        flash(true, "LEVEL SET");
+        return;
+      }
+      int k = fabsf(a[0]) > fabsf(a[1]) ? 0 : 1;
+      if (fabsf(a[k]) > 0.7f) {                    // standing up, port 6 down
+        longAxis = k; longSign = a[k] >= 0 ? 1 : -1; calibrated = true;
+        prefs.putInt("axis", longAxis); prefs.putFloat("lsign", longSign); prefs.putBool("cal", true);
+        flash(true, "DOWN SET");
+        return;
+      }
+      flash(false, "FLAT/UPRIGHT?");
+    }
+    static void refill() {                         // A only: new round, A full, B empty
+      newRound(roundNo + 1);
+      prefs.putUChar("round", roundNo);
+      needRefill = false;
+      flash(true, "REFILLED");
+      sendBeat();
+    }
+
+    // ---- output -------------------------------------------------------------------------------
+    static void showLeds() {
+      for (int r = 0; r < ROWS; r++) {
+        int pr = flipEnds ? ROWS - 1 - r : r;      // the glass's row -> the strip's row
+        NeoPixelGrid *g = grids[pr / 3];
+        int lr = pr % 3; if (GRID_FLIP_ROW) lr = 2 - lr;
+        for (int c = 0; c < COLS; c++) {
+          int lc = GRID_FLIP_COL ? 2 - c : c;
+          uint8_t id = cell[r][c];
+          if (id == EMPTY) g->setPixelXY(lr, lc, 0, 0, 0);
+          else g->setPixelXY(lr, lc, ballR[id], ballG[id], ballB[id]);
+        }
+      }
+      for (int i = 0; i < 6; i++) grids[i]->show();
+    }
+
+    static bool imuOk = false;
+
+    static void drawScreen() {
+      screen.fillScreen(ATECH_BG);
+      // The glass on its side: rim (port 1) on the left, bottom (port 6) on the right.
+      const int S = 8, X0 = 8, Y0 = 4;
+      for (int r = 0; r < ROWS; r++)
+        for (int c = 0; c < COLS; c++) {
+          int x = X0 + (flipEnds ? ROWS - 1 - r : r) * S, y = Y0 + c * S;
+          uint8_t id = cell[r][c];
+          if (id == EMPTY) screen.drawRect(x + 2, y + 2, S - 4, S - 4, 0x2104);
+          else screen.fillCircle(x + S / 2, y + S / 2, 3, rgb565(id));
+        }
+      int rimX = flipEnds ? X0 + ROWS * S + 1 : X0 - 3;
+      screen.drawLine(rimX, Y0, rimX, Y0 + COLS * S - 1, heard() ? ATECH_OK : ATECH_WARN);   // the rim
+
+      char buf[24];
+      int n = countHere() + nPending;
+      snprintf(buf, sizeof buf, "%d", n);
+      screen.setTextSize(3);
+      screen.setTextColor(ATECH_FG);
+      screen.setCursor(8, 34);
+      screen.print(buf);
+      screen.setTextSize(1);
+      int tx = 8 + 18 * (n >= 10 ? 2 : 1) + 4;
+      screen.setCursor(tx, 36);
+      snprintf(buf, sizeof buf, "of %d here", NBALLS);
+      screen.print(buf);
+      screen.setCursor(tx, 48);
+      if (heard()) snprintf(buf, sizeof buf, "%s has %d", isA() ? "B" : "A", peerCount);
+      else snprintf(buf, sizeof buf, "%s: ?", isA() ? "B" : "A");
+      screen.print(buf);
+
+      // Big: TX (transmitter) while this glass pours balls out over the radio,
+      // RX (receiver) the rest of the time: it is listening, or catching balls.
+      bool txNow = lastPourMs && millis() - lastPourMs < 1500;
+      bool rxNow = lastInMs && millis() - lastInMs < 1500;
+      screen.setTextSize(3);
+      screen.setTextColor(txNow ? ATECH_ACCENT : rxNow ? ATECH_OK : ATECH_FG);
+      screen.setCursor(120, 31);
+      screen.print(txNow ? "TX" : "RX");
+      if (txNow) {                                 // radio waves leaving
+        for (int k = 0; k < 3; k++) screen.drawCircle(157, 42, 3 + 4 * k, ATECH_ACCENT);
+        screen.fillRect(158, 28, 2, 30, ATECH_BG);
+      }
+      screen.setTextSize(1); screen.setTextColor(0x8410);
+      screen.setCursor(110, 31); screen.print(isA() ? "A" : isB() ? "B" : "?");
+
+      screen.setTextSize(1);
+      screen.setCursor(8, 70);
+      if (msgUntil) { screen.setTextColor(ATECH_ACCENT); screen.print(msg); }
+      else if (!role) { screen.setTextColor(ATECH_ALERT); screen.print("set balls_role"); }
+      else if (!heard()) { screen.setTextColor(ATECH_WARN); screen.print(isA() ? "RX: no signal from B" : "RX: no signal from A"); }
+      else if (txNow) { screen.setTextColor(ATECH_ACCENT); screen.print("TX = transmitter: sending"); }
+      else if (rxNow) { screen.setTextColor(ATECH_OK); screen.print("RX = receiver: catching"); }
+      else { screen.setTextColor(ATECH_FG); screen.print("RX = receiver: listening"); }
+
+      screen.setCursor(100, 58);
+      screen.setTextColor(imuOk ? ATECH_FG : ATECH_ALERT);
+      if (imuOk) snprintf(buf, sizeof buf, "tilt %d", (int)imu.getTiltAngle());
+      else snprintf(buf, sizeof buf, "no IMU");
+      screen.print(buf);
+      screen.display();
+    }
+
+    // ---- settings menu (knob) ---------------------------------------------------------------
+    enum Menu { M_OFF, M_LIST, M_DIR, M_BRIGHT, M_NCOL, M_COL };
+    static Menu menu = M_OFF;
+    static int menuIdx = 0, colIdx = 0;
+    static unsigned long menuTouched = 0;
+    static const char *ITEMS[4] = {"Direction", "Brightness", "Colours", "Done"};
+
+    static void ring() {
+      if (menu == M_OFF) { knob.enableRing(false); return; }
+      knob.enableRing(true);
+      knob.setRingBrightness(20);
+      if (menu == M_COL) { const Named &c = PALETTE[colourPick[colIdx]]; knob.setRingColor(c.r, c.g, c.b); }
+      else knob.setRingColor(0, 120, 255);
+    }
+
+    static void menuTurn(int d) {
+      menuTouched = millis();
+      switch (menu) {
+        case M_LIST:   menuIdx = (menuIdx + d + 4) % 4; break;
+        case M_DIR:    flipEnds = !flipEnds; break;
+        case M_BRIGHT: brightLevel = constrain(brightLevel + d, 0, 9);
+                       for (int i = 0; i < 6; i++) grids[i]->setBrightness(BRIGHT[brightLevel]); break;
+        case M_NCOL:   nColours = (nColours + d + 5) % 5; makeColours(); break;
+        case M_COL:    colourPick[colIdx] = (colourPick[colIdx] + d + NPAL) % NPAL; makeColours(); break;
+        default: break;
+      }
+      ring();
+    }
+
+    static void menuPress() {
+      menuTouched = millis();
+      switch (menu) {
+        case M_OFF:    menu = M_LIST; menuIdx = 0; break;
+        case M_LIST:   menu = menuIdx == 0 ? M_DIR : menuIdx == 1 ? M_BRIGHT : menuIdx == 2 ? M_NCOL : M_OFF; break;
+        case M_DIR:    applySettings(false); menu = M_LIST; break;          // this glass only
+        case M_BRIGHT: applySettings(true); sendBeat(); menu = M_LIST; break;
+        case M_NCOL:   if (nColours == 0) { applySettings(true); sendBeat(); menu = M_LIST; }
+                       else { colIdx = 0; menu = M_COL; } break;
+        case M_COL:    if (++colIdx >= nColours) { applySettings(true); sendBeat(); menu = M_LIST; } break;
+      }
+      ring();
+    }
+
+    static void drawMenu() {
+      screen.fillScreen(ATECH_BG);
+      screen.setTextSize(1);
+      screen.setTextColor(ATECH_ACCENT);
+      screen.setCursor(4, 2);
+      screen.print("SETTINGS  turn / press");
+      char buf[28];
+      for (int i = 0; i < 4; i++) {
+        int y = 16 + i * 15;
+        bool sel = (menu == M_LIST && i == menuIdx) || (menu == M_DIR && i == 0) ||
+                   (menu == M_BRIGHT && i == 1) || ((menu == M_NCOL || menu == M_COL) && i == 2);
+        bool editing = sel && menu != M_LIST;
+        if (sel) screen.fillRect(0, y - 3, 160, 14, editing ? 0x0210 : 0x2104);
+        screen.setTextColor(ATECH_FG);
+        screen.setCursor(6, y);
+        screen.print(ITEMS[i]);
+        screen.setCursor(78, y);
+        screen.setTextColor(editing ? ATECH_ACCENT : 0x8410);
+        if (i == 0) screen.print(flipEnds ? "mouth: port 6" : "mouth: port 1");
+        if (i == 1) { snprintf(buf, sizeof buf, "%d / 10", brightLevel + 1); screen.print(buf);
+                      screen.fillRect(118, y, 4 * (brightLevel + 1), 7, ATECH_ACCENT); }
+        if (i == 2) {
+          if (menu == M_COL) { snprintf(buf, sizeof buf, "%d: %s", colIdx + 1, PALETTE[colourPick[colIdx]].name); screen.print(buf); }
+          else if (nColours == 0) screen.print("rainbow");
+          else {
+            snprintf(buf, sizeof buf, "%d:", nColours); screen.print(buf);
+            for (int k = 0; k < nColours; k++) {
+              const Named &c = PALETTE[colourPick[k]];
+              screen.fillCircle(100 + k * 12, y + 3, 4, ((c.r & 0xF8) << 8) | ((c.g & 0xFC) << 3) | (c.b >> 3));
+            }
+          }
+        }
+      }
+      screen.display();
+    }
+  setup: |
+    clearGlass();
+    makeColours();
+    bootId = (uint16_t)(esp_random() | 1);
+    prefs.begin("ballpour4", false);
+    role = prefs.getUChar("role", 0);
+    roundNo = prefs.getUChar("round", 0);
+    longAxis = prefs.getInt("axis", 0);
+    longSign = prefs.getFloat("lsign", -1);
+    latSign = prefs.getFloat("latsign", -1);
+    zeroX = prefs.getFloat("zx", 0); zeroY = prefs.getFloat("zy", 0);
+    calibrated = prefs.getBool("cal", false);
+    setVer = prefs.getUShort("sv", 0);
+    nColours = prefs.getUChar("nc", 0); if (nColours > 4) nColours = 0;
+    prefs.getBytes("pk", colourPick, 4);
+    for (int k = 0; k < 4; k++) colourPick[k] %= NPAL;
+    brightLevel = prefs.getUChar("br", 4); if (brightLevel > 9) brightLevel = 4;
+    flipEnds = prefs.getBool("flip", false);
+    knob.setAcceleration(false, 1);
+    knob.enableRing(false);
+    makeColours();
+    if (isA()) { roundNo++; prefs.putUChar("round", roundNo); }   // A starts a new round: full
+    newRound(roundNo);
+    btn.setColor(0, 0, 80);
+    for (int i = 0; i < 6; i++) { grids[i]->setBrightness(BRIGHT[brightLevel]); grids[i]->clear(); grids[i]->show(); }
+    radioBegin();
+  loop: |
+    static EveryTimer beatTick, drawTick, ledTick, eventTick, imuTick;
+    // Health: loop passes, slowest pass, slowest status print (to find stalls).
+    static uint32_t loops = 0, maxLoopMs = 0, maxPrintMs = 0, loopStart = 0;
+    if (loopStart) { uint32_t d = millis() - loopStart; if (d > maxLoopMs) maxLoopMs = d; }
+    loopStart = millis(); loops++;
+    static unsigned long lastStep = 0, pressStart = 0;
+    static bool pressing = false, longDone = false;
+
+    // Take the newest message from the other glass; let its poured balls in one by one.
+    Beat b;
+    if (takeBeat(b)) onBeat(b);
+    if (needRefill && isA()) refill();             // B restarted: start over
+    letIn();
+
+    if (imuTick.ready(500)) imuOk = imu.isConnected();
+
+    // Knob: settings.
+    static int32_t knobLast = 0;
+    knob.update();
+    int32_t kp = knob.getPosition();
+    if (kp != knobLast) { int d = kp > knobLast ? 1 : -1; knobLast = kp; if (menu != M_OFF) menuTurn(d); }
+    if (knob.wasPressed()) menuPress();
+    if (menu != M_OFF && millis() - menuTouched > 20000) {   // untouched: keep what is set, close
+      if (menu == M_COL || menu == M_NCOL || menu == M_BRIGHT) { applySettings(true); sendBeat(); }
+      else applySettings(false);
+      menu = M_OFF; ring();
+    }
+
+    float a[3] = {imu.readAccelX() - zeroX, imu.readAccelY() - zeroY, imu.readAccelZ()};
+    int latAxis = longAxis == 0 ? 1 : 0;
+    float gLong = 1.0f, gLat = 0.0f;               // no IMU: upright, port 6 down
+    if (imuOk) {
+      gLong = longSign * a[longAxis]; gLat = latSign * a[latAxis];
+      if (flipEnds) gLong = -gLong;                // mouth at port 6: the glass is upside down
+      if (fabsf(gLong) < 0.08f && fabsf(gLat) < 0.3f) gLong = 0.3f;   // flat: settle at the bottom
+    }
+    if (millis() - lastStep >= TICK_MS) { lastStep = millis(); step(gLong, gLat); }
+
+    // Send right away when a ball pours, and 5 times a second anyway.
+    if (pouredNow) { pouredNow = false; sendBeat(); }
+    if (beatTick.ready(200)) sendBeat();
+
+    // Button: short press calibrates; hold 2 s on A refills.
+    bool down = btn.isPressed();
+    if (down && !pressing) { pressing = true; pressStart = millis(); longDone = false; }
+    if (down && pressing && !longDone && isA() && millis() - pressStart > 2000) { longDone = true; refill(); }
+    if (!down && pressing) { pressing = false; if (!longDone && millis() - pressStart > 30) calibrate(); }
+    if (msgUntil && millis() > msgUntil) { msgUntil = 0; btn.setColor(0, 0, 80); }
+
+    if (ledTick.ready(30)) showLeds();
+    if (drawTick.ready(100)) { if (menu != M_OFF) drawMenu(); else drawScreen(); }
+    if (eventTick.ready(1000)) {
+      uint32_t p0 = millis();
+      Serial.printf("{\"type\":\"event\",\"payload\":{\"event_type\":\"state\",\"key\":\"balls\",\"value\":{\"role\":\"%s\",\"here\":%d,\"pending\":%d,\"out\":%lu,\"in\":%lu,\"round\":%d,\"heard\":%d,\"sent\":%u,\"msgs_in\":%u,\"lost\":%u,\"g_long\":%.2f,\"g_lat\":%.2f,\"up_s\":%lu,\"reset\":%d,\"loops\":%u,\"max_loop_ms\":%u,\"max_print_ms\":%u}}}\n",
+                    isA() ? "A" : isB() ? "B" : "none", countHere(), nPending, (unsigned long)pouredTotal, (unsigned long)receivedTotal,
+                    roundNo, heard() ? 1 : 0, (unsigned)sentCount, (unsigned)heardCount, (unsigned)lostCount,
+                    gLong, gLat, millis() / 1000, (int)esp_reset_reason(), (unsigned)loops, (unsigned)maxLoopMs, (unsigned)maxPrintMs);
+      uint32_t pd = millis() - p0; if (pd > maxPrintMs) maxPrintMs = pd;
+    }
+
+    if (atech_action == "balls_role") {
+      if (atech_value == "tx" || atech_value == "a") role = 1;
+      else if (atech_value == "rx" || atech_value == "b") role = 2;
+      else role = 0;
+      prefs.putUChar("role", role);
+      if (isA()) { roundNo++; prefs.putUChar("round", roundNo); }
+      newRound(roundNo);
+      atechDone();
+    }
+    if (atech_action == "balls_calibrate") { calibrate(); atechDone(); }
+    if (atech_action == "balls_refill" && isA()) { refill(); atechDone(); }
+    if (atech_action == "balls_flip_lat") { latSign = -latSign; prefs.putFloat("latsign", latSign); atechDone(); }
